@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>سلبود — Silbood</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  * { font-family:'Cairo',sans-serif; }
+  body { background:#F5F7F5; color:#15201B; }
+  .ink { color:#15201B; }
+  .btn { border-radius:14px; font-weight:700; transition:.15s; cursor:pointer; }
+  .btn:active { transform:scale(.97); }
+  .card { background:#fff; border:1px solid #E3E9E3; border-radius:18px; }
+  input,select { background:#fff; border:1.5px solid #D7E0D8; border-radius:12px; padding:.65rem .9rem; width:100%; outline:none; }
+  input:focus,select:focus { border-color:#0A7C42; }
+  ::-webkit-scrollbar{width:8px} ::-webkit-scrollbar-thumb{background:#CBD5CD;border-radius:8px}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useMemo,useRef} = React;
+
+/* ============ ثوابت القوانين (من ملف قضية المحكمة) ============ */
+const RULES = {
+  SOLO_POINTS:20, GROUP_POINTS:10, DAILY_CAP:3,
+  REDEEM_POINTS:500, REDEEM_JOD:0.30,
+  MONTHLY_POOL:30, RESERVE:5,
+  BADGES:[{n:'برونزي',p:500,i:'🥉'},{n:'فضي',p:1500,i:'🥈'},{n:'ذهبي',p:3000,i:'🥇'}],
+  SPOT_CHECK_RATE:0.10, VIDEO_DELETE_HOURS:24, SCOPE:'25 طالباً — الصف التاسع فقط', MIN_PHOTOS:2,
+  SUBJECTS:['عربي','إنجليزي','رياضيات','فيزياء','كيمياء','أحياء','حاسوب','اجتماعيات','تربية إسلامية'],
+  SUPERVISOR:'المشرف المسؤول',
+};
+const SUP_USER='rayed';
+const SUPERVISOR_PASS='RAED2026';
+const LS='silbood_v1';
+const pad=n=>String(n).padStart(2,'0');
+const localDate=d=>d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate());
+const today=()=>localDate(new Date());
+const monthKey=()=>{ const d=new Date(); return d.getFullYear()+'-'+pad(d.getMonth()+1); };
+const SESSION_KEY='silbood_session';
+const getSession=()=>{ try{ const s=JSON.parse(sessionStorage.getItem(SESSION_KEY)); return (s&&s.uid&&s.role)?s:null; }catch(e){ return null; } };
+/* ضغط الصورة قبل حفظها (حتى ما يفوق التخزين) */
+const compressPhoto=(file,cb)=>{
+  const fr=new FileReader();
+  fr.onerror=()=>cb('تعذر قراءة الملف');
+  fr.onload=()=>{
+    const img=new Image();
+    img.onerror=()=>cb('تعذر قراءة الصورة');
+    img.onload=()=>{
+      try{
+        const maxD=1000, sc=Math.min(1, maxD/Math.max(img.width,img.height));
+        const w=Math.round(img.width*sc), h=Math.round(img.height*sc);
+        const cv=document.createElement('canvas'); cv.width=w; cv.height=h;
+        cv.getContext('2d').drawImage(img,0,0,w,h);
+        cb(null, cv.toDataURL('image/jpeg',0.65));
+      }catch(e){ cb(String(e)); }
+    };
+    img.src=fr.result;
+  };
+  fr.readAsDataURL(file);
+};
+const jod=n=>n.toFixed(2).replace('.',',')+' د.أ';
+const fmt=t=>new Date(t).toLocaleDateString('ar-JO',{day:'numeric',month:'short'})+' '+new Date(t).toLocaleTimeString('ar-JO',{hour:'2-digit',minute:'2-digit'});
+
+const seed=()=>({
+  students:[],assignments:[],groups:[],history:[],payouts:[],pubs:[],
+  pool:{month:monthKey(),remaining:RULES.MONTHLY_POOL},
+  supervisor:{id:'SUP',name:RULES.SUPERVISOR}
+});
+const load=()=>{ try{ const d=JSON.parse(localStorage.getItem(LS)); if(d&&d.students) return d; }catch(e){} const s=seed(); localStorage.setItem(LS,JSON.stringify(s)); return s; };
+const save=d=>localStorage.setItem(LS,JSON.stringify(d));
+
+/* فيديوهات أعلم الساعة 24: تنظيف عند كل قراءة */
+const cleanVideos=d=>{
+  const now=Date.now(); let changed=false;
+  d.assignments.forEach(a=>{ if(a.video && a.videoDeleteAt && a.videoDeleteAt<now){ delete a.video; a.videoDeleted=true; changed=true; } });
+  if(changed) save(d);
+  return d;
+};
+
+const INITIAL=(()=>{ let d=load(); let ch=false; const now=Date.now();
+  d.assignments.forEach(a=>{ if(a.video&&a.videoDeleteAt&&a.videoDeleteAt<now){ delete a.video; a.videoDeleted=true; ch=true; } });
+  if(!d.pubs){ d.pubs=[]; ch=true; }
+  if(d.supervisor.name!==RULES.SUPERVISOR){ d.supervisor={id:'SUP',name:RULES.SUPERVISOR}; ch=true; }
+  if(ch) localStorage.setItem(LS,JSON.stringify(d));
+  return d;
+})();
+
+function App(){
+  /* الجلسة محفوظة كل تاب على حدة (sessionStorage) — الريفرش ما بيطلعك من حسابك */
+  const sess0=getSession();
+  const [db,setDb]=useState(INITIAL);
+  const [user,setUser]=useState(sess0?{id:sess0.uid}:null);
+  const [role,setRole]=useState(sess0?sess0.role:null);
+  useEffect(()=>save(db),[db]);
+  /* مزامنة فورية بين التابات: أي تغيير بالتاب الثاني يوصل هون لحظياً (بدون ريفرش) */
+  useEffect(()=>{
+    const sync=()=>{
+      const fresh=load();
+      setDb(prev=>{
+        try{ if(JSON.stringify(prev)===JSON.stringify(fresh)) return prev; }catch(e){}
+        return fresh;
+      });
+    };
+    window.addEventListener('storage', sync);   // التاب الثاني غيّر شي → لحظة
+    window.addEventListener('focus', sync);     // رجعت للتاب
+    window.addEventListener('visibilitychange', sync);
+    return ()=>{ window.removeEventListener('storage', sync); window.removeEventListener('focus', sync); window.removeEventListener('visibilitychange', sync); };
+  },[]);
+
+  const me=user && (role==='sup'?db.supervisor:db.students.find(s=>s.id===user.id));
+  /* كل كتابة تبدأ من أحدث نسخة بالتخزين — حتى ما يكتب تاب فوق شي جديد حطه تاب ثاني */
+  const upd=fn=>setDb(d=>{
+    let base=d;
+    try{
+      const fresh=JSON.parse(localStorage.getItem(LS));
+      if(fresh && JSON.stringify(fresh)!==JSON.stringify(d)) base=fresh;
+    }catch(e){}
+    fn(base); return {...base};
+  });
+
+  /* ---- auth ---- */
+  const setSession=(uid,role2)=>{ try{ sessionStorage.setItem(SESSION_KEY,JSON.stringify({uid,role:role2})); }catch(e){} };
+  const loginStudent=(u,p)=>{ const s=db.students.find(x=>x.username===u&&x.password===p); if(!s) return 'لا يوجد حساب بهذه البيانات'; setUser({id:s.id}); setRole('stu'); setSession(s.id,'stu'); return null; };
+  const loginSupervisor=(u,p)=>{ if(u!==SUP_USER) return 'اسم المشرف غير صحيح'; if(p!==SUPERVISOR_PASS) return 'كلمة مرور المشرف غير صحيحة'; setRole('sup'); setUser({id:'SUP'}); setSession('SUP','sup'); return null; };
+  const signup=(name,username,password,consent)=>{ 
+    if(db.students.find(x=>x.username===username)) return 'اسم المستخدم محجوز';
+    if(!consent) return 'لازم موافقة ولي الأمر والموافقة على الشروط';
+    const s={id:'S'+Date.now(),name,username,password,points:0,createdAt:Date.now(),streak:0,lastDay:null};
+    upd(d=>d.students.push(s)); setUser({id:s.id}); setRole('stu'); setSession(s.id,'stu'); return null;
+  };
+  const logout=()=>{ try{ sessionStorage.removeItem(SESSION_KEY); }catch(e){} setDb(load()); setUser(null); setRole(null); };
+
+  /* ---- streak ---- */
+  const bumpStreak=(d,sid)=>{ const s=d.students.find(x=>x.id===sid); const t=today();
+    if(s.lastDay!==t){ s.streak = (s.lastDay===localDate(new Date(Date.now()-864e5))) ? s.streak+1 : 1; s.lastDay=t; }
+  };
+
+  /* ---- assignment ---- */
+  const todayCount=(d,sid)=>d.assignments.filter(a=>a.sid===sid&&a.day===today()&&a.status!=='rejected').length;
+  const submit=(sid,{subject,title,type,groupId,pubId,photos})=>{
+    if(!Array.isArray(photos)||photos.length<RULES.MIN_PHOTOS) return 'لازم تتوفر '+RULES.MIN_PHOTOS+' صور على الأقل لحلّك';
+    if(new Set(photos).size!==photos.length) return 'في صور مكررة — بدّل الصور المتشابهة';
+    let msg=null;
+    upd(d=>{
+      if(todayCount(d,sid)>=RULES.DAILY_CAP){ msg='خلصت حدك اليومي ('+RULES.DAILY_CAP+' واجبات) — رجوع بكرة 💪'; return; }
+      const spot = Math.random()<RULES.SPOT_CHECK_RATE;
+      const g=type==='group'? d.groups.find(x=>x.id===groupId):null;
+      const a={id:'A'+Date.now()+Math.floor(Math.random()*99),sid,subject,title,type,groupId,pubId:pubId||null,
+        photos,status:spot?'awaiting':'pending',points:type==='group'?RULES.GROUP_POINTS:RULES.SOLO_POINTS,day:today(),ts:Date.now(),
+        room:g?g.room:null};
+      d.assignments.push(a);
+      d.history.push({t:Date.now(),sid,type:'submit',note:(type==='group'?'واجب جماعي':'واجب فردي')+' — '+subject+' (مع '+photos.length+' صور)',pts:0});
+    });
+    return msg;
+  };
+  const attachVideo=(aid,file,cb)=>{ if(file.size>2.5e6){cb('الفيديو كبير — لا يزيد عن 2.5MB');return;}
+    const r=new FileReader();
+    r.onload=()=>upd(d=>{ const a=d.assignments.find(x=>x.id===aid); if(a){ a.video=r.result; a.videoDeleteAt=Date.now()+RULES.VIDEO_DELETE_HOURS*36e5; a.status='pending'; } });
+    r.readAsDataURL(file);
+    cb(null);
+  };
+
+  /* ---- supervisor actions ---- */
+  const approve=(aid)=>upd(d=>{ const a=d.assignments.find(x=>x.id===aid); if(!a||a.status!=='pending')return;
+    a.status='approved'; const s=d.students.find(x=>x.id===a.sid); s.points+=a.points; bumpStreak(d,a.sid);
+    d.history.push({t:Date.now(),sid:a.sid,type:'approve',note:(a.type==='group'?'جماعي':'فردي')+' — '+a.subject,pts:a.points});
+  });
+  const reject=(aid,why)=>upd(d=>{ const a=d.assignments.find(x=>x.id===aid); if(!a)return; a.status='rejected'; a.why=why||'';
+    d.history.push({t:Date.now(),sid:a.sid,type:'reject',note:'رُفض — '+(why||'قرار المشرف'),pts:0});
+  });
+  const setPool=n=>upd(d=>{ d.pool={month:monthKey(),remaining:n}; });
+
+  /* ---- payout ---- */
+  const redeem=(sid)=>{ let m=null; upd(d=>{
+      const s=d.students.find(x=>x.id===sid); if(s.points<RULES.REDEEM_POINTS){ m='ناقصك '+(RULES.REDEEM_POINTS-s.points)+' نقطة للاستبدال'; return; }
+      if(d.pool.month!==monthKey()) d.pool={month:monthKey(),remaining:RULES.MONTHLY_POOL};
+      s.points-=RULES.REDEEM_POINTS;
+      const paid=d.pool.remaining>=RULES.REDEEM_JOD;
+      if(paid) d.pool.remaining=+(d.pool.remaining-RULES.REDEEM_JOD).toFixed(2);
+      d.payouts.push({id:'P'+Date.now(),sid,day:today(),status:paid?'جاهز للاستلام من المشرف':'قائمة الانتظار — أول الشهر القادم',paid});
+      d.history.push({t:Date.now(),sid,type:'redeem',note:paid?'استبدال 500 نقطة → 30 قرشاً (من الصندوق)':'استبدال 500 نقطة → مُدرج بقائمة الانتظار',pts:-RULES.REDEEM_POINTS});
+    }); return m; };
+
+  const markPaid=pid=>upd(d=>{ const p=d.payouts.find(x=>x.id===pid); if(p)p.status='تمّ تسليمه ✓'; });
+
+  /* ---- groups ---- */
+  const createGroup=(name,sid,opts)=>{ const g={id:'G'+Date.now(),name,room:'Silbood-'+Math.random().toString(36).slice(2,8),by:sid,ts:Date.now(),
+    visibility:(opts&&opts.visibility)||'public',invited:(opts&&opts.invited)||[],code:Math.random().toString(36).slice(2,8)}; upd(d=>d.groups.unshift(g)); return g; };
+  const delGroup=gid=>upd(d=>{ d.groups=d.groups.filter(g=>g.id!==gid); });
+
+  /* دخول غرفة من رابط مشاركة (#room=...&key=...) */
+  const tryRoomJoin=()=>{ if(role!=='stu'||!user) return;
+    const m=location.hash.match(/room=([A-Za-z0-9-]+)&key=([A-Za-z0-9]+)/);
+    if(!m) return;
+    const [,roomName,key]=m;
+    upd(d=>{
+      const g=d.groups.find(x=>x.room===roomName);
+      if(!g){ alert('ما في غرفة بهذا الرابط'); return; }
+      if(g.visibility==='private' && g.by!==user.id && !(g.invited||[]).includes(user.id) && g.code!==key){ alert('الغرفة خاصة — ما عندك صلاحية دخول'); return; }
+      if(g.visibility==='private' && g.by!==user.id && !(g.invited||[]).includes(user.id)) g.invited=[...(g.invited||[]), user.id];
+      try{ sessionStorage.setItem('silbood_open_room', g.id); }catch(e){}
+    });
+    try{ history.replaceState(null,'',location.pathname); }catch(e){}
+  };
+  useEffect(()=>{
+    window.addEventListener('hashchange', tryRoomJoin);
+    tryRoomJoin();
+    return ()=>window.removeEventListener('hashchange', tryRoomJoin);
+  },[role, user&&user.id]);
+
+  /* ---- نشر الواجبات (المشرف فقط) ---- */
+  const publish=(subject,title)=>{ if(!title.trim()) return 'اكتب عنوان الواجب'; upd(d=>d.pubs.unshift({id:'B'+Date.now()+Math.floor(Math.random()*99),subject,title:title.trim(),ts:Date.now()})); return null; };
+  const delPub=pid=>upd(d=>{ d.pubs=d.pubs.filter(p=>p.id!==pid); });
+
+  /* ---- leaderboard ---- */
+  const board=[...db.students].sort((a,b)=>b.points-a.points);
+  const badge=pts=>{ let b=RULES.BADGES[0]; RULES.BADGES.forEach(x=>{if(pts>=x.p)b=x}); return b; };
+
+  if(!user) return <Auth loginStudent={loginStudent} loginSupervisor={loginSupervisor} signup={signup}/>;
+  if(role==='sup') return <Sup db={db} approve={approve} reject={reject} attachVideo={attachVideo} setPool={setPool} markPaid={markPaid} publish={publish} delPub={delPub} logout={logout}/>;
+  return <Student db={db} me={me} submit={submit} redeem={redeem} createGroup={createGroup} delGroup={delGroup} attachVideo={attachVideo} board={board} badge={badge} logout={logout}/>;
+}
+
+/* ================= شاشة الدخول ================= */
+/* ================= شروط وخصوصية + توقيع ولي الأمر ================= */
+function TermsModal({onClose}){
+  return (
+    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="card w-full max-w-lg max-h-[90vh] overflow-y-auto p-5" onClick={e=>e.stopPropagation()}>
+        <div className="flex justify-between items-center mb-3">
+          <h2 className="font-black text-xl text-[#0A7C42]">الشروط والخصوصية</h2>
+          <button onClick={onClose} className="btn text-gray-400 text-xl">✕</button>
+        </div>
+        <div className="space-y-4 text-sm leading-relaxed text-gray-700">
+          <section>
+            <h3 className="font-bold text-[#15201B]">🔒 الخصوصية</h3>
+            <ul className="list-disc pr-5 space-y-1">
+              <li>صور الحل (2 على الأقل) هي دليل تسليم واجب — يراها فقط المشرف (ولي الأمر) لغرض المراجعة.</li>
+              <li>فيديوهات المراجعة العشوائية (10%) تُحذف تلقائياً بعد 24 ساعة من مراجعتها.</li>
+              <li>لا تُشارك بياناتك nor صورك مع أي طرف ثالث.</li>
+              <li>في هذه المرحلة (تجربة) البيانات تُحفظ على جهازك؛ في المرحلة الثانية (Supabase) تُحفظ بسحابة آمنة.</li>
+            </ul>
+          </section>
+          <section>
+            <h3 className="font-bold text-[#15201B]">📜 شروط الاستخدام (18 شرطاً — وقع عليها ولي الأمر)</h3>
+            <ol className="list-decimal pr-5 space-y-1">
+              <li>المشرف (ولي الأمر) هو مالك البيانات ومراجعها (data controller).</li>
+              <li>المشرف يضمن صرف المكافآت (حتى 30 دينار/شهر) — صندوق شهري + احتياط 5 دنانير.</li>
+              <li>إذا فرغ الصندوق، صرف الاستبدال يُؤجل إلى أول الشهر القادم (نقاطك لا تنتهي).</li>
+              <li>المشرف يراجع ويعتمد/يرفض كل واجب — لا تُمنح نقاط بدون موافقته.</li>
+              <li>الحل فردي = 20 نقطة، جماعي = 10 نقاط (كل عضو يرفق صورته).</li>
+              <li>الحد الأقصى 3 واجبات باليوم.</li>
+              <li>500 نقطة = 30 قرشاً أردنياً.</li>
+              <li>500/1500/3000 نقطة = أوسمة برونزي/فضي/ذهبي.</li>
+              <li>فحص عشوائي 10%: شرح 15 ثانية (فيديو) — يُحذف بعد 24 ساعة.</li>
+              <li>الغرف: عام (الكل) أو خاص (بدعوة/رابط) — المالك يتحكم.</li>
+              <li>النطاق: 25 طالباً — الصف التاسع فقط.</li>
+              <li>التجربة: 5 طلاب × أسبوع (3 من 5 يعودون = نجاح).</li>
+              <li>موافقة ولي الأمر مطلوبة لكل طالب (ورقة موقعة).</li>
+              <li>المشرف يملك "قوة الإيقاف" (pause) في أي وقت.</li>
+              <li>المشرف يراجع الاعتراضات (appeals).</li>
+              <li>الامتحانات (40-50 نقطة، كاميرا + AI) مؤجلة للمرحلة (2) — غير مفعّلة في التجربة.</li>
+              <li>لا يوجد نموذج إيرادات حالياً — التمويل (1 دينار/يوم) من المؤسس.</li>
+              <li>التمويل (1 دينار/يوم ≈ 30 دينار/شهر) من المؤسس (ولي الأمر).</li>
+            </ol>
+          </section>
+          <section>
+            <h3 className="font-bold text-[#15201B]">✍️ التوقيع (ولي الأمر)</h3>
+            <div className="bg-gray-50 border border-gray-200 rounded-xl p-3">
+              <p className="font-bold">المشرف (ولي الأمر): رائد سلطان الجراونة</p>
+              <p className="text-xs text-gray-500">وقّع على 18 شرطاً • التوقيع (على الورقة المحفوظة) • النطاق: 25 طالباً (الصف التاسع)</p>
+              <p className="text-xs text-gray-400 mt-1">ملاحظة: صورة التوقيع (مع الأرقام) محفوظة offline — لا تُنشر على الموقع حفاظاً على الخصوصية.</p>
+            </div>
+          </section>
+          <p className="text-xs text-gray-400 text-center">سلبود — 2026</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Auth({loginStudent,loginSupervisor,signup}){
+  const [tab,setTab]=useState('in');
+  const [err,setErr]=useState(null);
+  const [showT,setShowT]=useState(false);
+  const [f,setF]=useState({name:'',username:'',password:'',consent:false,sup:''});
+  return (
+  <div className="min-h-screen flex flex-col items-center justify-center p-4">
+    <div className="w-full max-w-md">
+      <div className="text-center mb-6">
+        <div className="text-6xl mb-2">🏫</div>
+        <h1 className="text-4xl font-black" style={{color:'#0A7C42'}}>سلبود</h1>
+        <p className="text-gray-500 mt-1">نقاطك لواجبك… ومصاريفك لجديتك</p>
+      </div>
+      <div className="card p-5">
+        <div className="flex gap-1 mb-4 bg-gray-100 rounded-xl p-1">
+          <button onClick={()=>setTab('in')} className={"flex-1 py-2 rounded-lg font-bold "+(tab==='in'?'bg-[#0A7C42] text-white':'text-gray-500')}>دخول</button>
+          <button onClick={()=>setTab('up')} className={"flex-1 py-2 rounded-lg font-bold "+(tab==='up'?'bg-[#0A7C42] text-white':'text-gray-500')}>حساب جديد</button>
+        </div>
+        {err&&<div className="mb-3 text-sm bg-red-50 text-red-700 border border-red-200 rounded-xl p-3">{err}</div>}
+        {tab==='in'?
+          <div className="space-y-3">
+            <input placeholder="اسم المستخدم" onChange={e=>setF({...f,username:e.target.value})}/>
+            <input type="password" placeholder="كلمة المرور" onChange={e=>setF({...f,password:e.target.value})}/>
+            <button onClick={()=>setErr(loginStudent(f.username,f.password))} className="btn w-full py-3 bg-[#0A7C42] text-white text-lg">دخول الطالب</button>
+            <details className="text-sm text-gray-500 mt-4">
+              <summary className="cursor-pointer font-bold">دخول المشرف (وليّ الأمر فقط)</summary>
+              <input className="mt-2" placeholder="اسم المشرف" onChange={e=>setF({...f,sup:e.target.value})}/>
+              <input className="mt-2" type="password" placeholder="كلمة مرور المشرف" onChange={e=>setF({...f,supPass:e.target.value})}/>
+              <button onClick={()=>setErr(loginSupervisor(f.sup,f.supPass))} className="btn w-full py-2 mt-2 bg-[#15201B] text-white">دخول لوحة المشرف</button>
+            </details>
+          </div>
+        :
+          <div className="space-y-3">
+            <input placeholder="اسمك الكامل" onChange={e=>setF({...f,name:e.target.value})}/>
+            <input placeholder="اسم المستخدم" onChange={e=>setF({...f,username:e.target.value})}/>
+            <input type="password" placeholder="كلمة مرور" onChange={e=>setF({...f,password:e.target.value})}/>
+            <div className="border border-orange-200 bg-orange-50 rounded-xl p-3 text-sm leading-relaxed">
+              <label className="flex items-start gap-2 cursor-pointer">
+                <input type="checkbox" className="mt-1 w-auto" checked={f.consent} onChange={e=>setF({...f,consent:e.target.checked})}/>
+                <span className="text-gray-700">ولي أمري وقّع على موافقة المشاركة، وأنا أوافق على شروط الموقع والخصوصية (الحل يُرفَق بصور، وفيديوهات المراجعة العشوائية تُحذف بعد 24 ساعة)</span>
+              </label>
+            </div>
+            <button type="button" onClick={()=>setShowT(true)} className="btn w-full py-2.5 bg-blue-600 text-white text-base">الشروط</button>
+            <button onClick={()=>setErr(signup(f.name.trim(),f.username.trim(),f.password,f.consent))} className="btn w-full py-3 bg-[#0A7C42] text-white text-lg">إنشاء الحساب</button>
+          </div>
+        }
+      </div>
+      <p className="text-center text-xs text-gray-400 mt-4">المشرف المسؤول: {RULES.SUPERVISOR} • {RULES.SCOPE} • <button onClick={()=>setShowT(true)} className="underline text-[#0A7C42]">الشروط والخصوصية</button></p>
+      {showT&&<TermsModal onClose={()=>setShowT(false)}/>}
+    </div>
+  </div>);
+}
+
+/* ================= الطالب ================= */
+function Student({db,me,submit,redeem,createGroup,delGroup,attachVideo,board,badge,logout}){
+  const [tab,setTab]=useState('home');
+  const [videoFor,setVideoFor]=useState(null); // aid needing upload
+  const [showT,setShowT]=useState(false);
+  const t=today();
+  const todayN=db.assignments.filter(a=>a.sid===me.id&&a.day===t&&a.status!=='rejected').length;
+  const pending=db.assignments.filter(a=>a.sid===me.id&&['pending','awaiting'].includes(a.status));
+  const myBadge=badge(me.points);
+  const tabs=[['home','الرئيسية','🏠'],['solve','الواجبات','✍️'],['rooms','الغرف','👥'],['board','المتصدرون','🏆'],['me','نقاطي','💰']];
+  return (
+    <div className="max-w-lg mx-auto pb-24">
+      {/* header */}
+    <div className="bg-[#0A7C42] text-white px-4 pt-5 pb-16 rounded-b-3xl">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className="text-2xl">🏫</span><span className="font-black text-xl">سلبود</span>
+        </div>
+        <button onClick={logout} className="text-white/70 text-sm btn px-3 py-1 border border-white/30">خروج</button>
+      </div>
+      <p className="mt-4 text-white/80">أهلاً يا {me.name.split(' ')[0]}</p>
+      <div className="mt-1 flex items-end gap-2">
+        <span className="text-5xl font-black">{me.points}</span>
+        <span className="mb-2 text-white/90 font-bold">نقطة مؤكدة</span>
+      </div>
+      <div className="mt-3 flex items-center gap-2">
+        <span className="bg-white/15 rounded-full px-3 py-1 text">🔥 سترِيك {me.streak} يوم</span>
+        <span className="bg-white/15 rounded-full px-3 py-1">{myBadge.i} {myBadge.n}</span>
+      </div>
+    </div>
+
+    <div className="px-4 -mt-10">
+      {tab==='home'&&<Home db={db} me={me} pending={pending} todayN={todayN} redeem={redeem} setTab={setTab}/>}
+      {tab==='solve'&&<Solve db={db} me={me} submit={submit} todayN={todayN} setTab={setTab}/>}
+      {tab==='rooms'&&<Rooms db={db} me={me} createGroup={createGroup} delGroup={delGroup}/>}
+      {tab==='board'&&<Board board={board} meId={me.id}/>}
+      {tab==='me'&&<Points db={db} me={me} redeem={redeem} pending={pending} attachVideo={attachVideo} videoFor={videoFor} setVideoFor={setVideoFor}/>}
+      <p className="text-center text-xs text-gray-400 mt-6 mb-16"><button onClick={()=>setShowT(true)} className="underline text-[#0A7C42]">الشروط والخصوصية • توقيع ولي الأمر</button></p>
+    </div>
+    {showT&&<TermsModal onClose={()=>setShowT(false)}/>}>
+
+    {/* bottom nav */}
+    <div className="fixed bottom-0 inset-x-0 bg-white border-t border-gray-200 flex justify-around py-2 max-w-lg mx-auto">
+      {tabs.map(([k,l,i])=>(
+        <button key={k} onClick={()=>setTab(k)} className={"flex flex-col items-center px-3 py-1 rounded-xl btn text-xs "+(tab===k?'text-[#0A7C42] font-black':'text-gray-400')}>{i}<span>{l}</span></button>
+      ))}
+    </div>
+  </div>);
+}
+
+function Home({db,me,pending,todayN,redeem,setTab}){
+  const canRedeem=me.points>=RULES.REDEEM_POINTS;
+  return (<div className="space-y-4">
+    <div className="card p-4">
+      <p className="font-bold mb-2">وضعيت اليوم</p>
+      <div className="flex gap-3 text-sm">
+        <div className="flex-1 bg-gray-50 rounded-xl p-3 text-center"><div className="text-2xl font-black">{todayN}/{RULES.DAILY_CAP}</div><div className="text-gray-500">واجبات اليوم</div></div>
+        <div className="flex-1 bg-gray-50 rounded-xl p-3 text-center"><div className="text-2xl font-black">{pending.length}</div><div className="text-gray-500">بانتظار المشرف</div></div>
+      </div>
+    </div>
+    <div className="card p-4">
+      <p className="font-bold mb-2">الصندوق هذا الشهر</p>
+      <div className="flex justify-between text-sm text-gray-600 mb-1"><span>المتبقي للصرف الفوري</span><b>{jod(db.pool.remaining)}</b></div>
+      <div className="h-3 bg-gray-100 rounded-full overflow-hidden"><div className="h-full bg-[#0A7C42]" style={{width:(db.pool.remaining/RULES.MONTHLY_POOL*100)+'%'}}/></div>
+      {me.points>=RULES.REDEEM_POINTS&&
+        <button onClick={()=>alert(redeem(me.id)||'تم الاستبدال')} className="btn mt-3 w-full py-3 bg-[#C9992E] text-white">استبدل 500 نقطة → 30 قرشاً</button>}
+    </div>
+    <div className="grid grid-cols-2 gap-3">
+      <button onClick={()=>setTab('solve')} className="card p-4 text-right btn"><span className="text-2xl">✍️</span><p className="font-bold mt-1">حل واجب</p><p className="text-xs text-gray-500">+20 نقطة (فردي)</p></button>
+      <button onClick={()=>setTab('rooms')} className="card p-4 text-right btn"><span className="text-2xl">👥</span><p className="font-bold mt-1">غرفة جماعية</p><p className="text-xs text-gray-500">+10 لكل مجموعة</p></button>
+    </div>
+    {db.history.filter(h=>h.sid===me.id).slice(-5).reverse().map((h,i)=>(
+      <div key={i} className="card px-4 py-2.5 flex justify-between items-center text-sm">
+        <span>{h.note}</span>
+        <span className={h.pts>0?'text-[#0A7C42] font-bold':h.pts<0?'text-red-600 font-bold':'text-gray-400'}>{h.pts>0?'+'+h.pts:h.pts<0?h.pts:''}</span>
+      </div>
+    ))}
+  </div>);
+}
+
+function Solve({db,me,submit,todayN,setTab}){
+  const [err,setErr]=useState(null);
+  const [grpSel,setGrpSel]=useState({});
+  const [phFor,setPhFor]=useState(null); // {pub,type,groupId} — نافذة الصور
+  const blocked=todayN>=RULES.DAILY_CAP;
+  const pubs=[...(db.pubs||[])].reverse();
+  const canSee=g=>g.visibility!=='private'||g.by===me.id||(g.invited||[]).includes(me.id);
+  const doneToday=ids=>{ const t=today(); return db.assignments.some(a=>a.sid===me.id&&a.day===t&&a.pubId===ids&&a.status!=='rejected'); };
+  const doSubmit=(pf,photos)=>{
+    const m=submit(me.id,{subject:pf.pub.subject,title:pf.pub.title,type:pf.type,groupId:pf.groupId||'',pubId:pf.pub.id,photos});
+    if(m)setErr(m); else {setErr(null); setPhFor(null);}
+  };
+  return (<div className="space-y-4 mt-2">
+    {err&&<div className="text-sm bg-red-50 text-red-700 border border-red-200 rounded-xl p-3">{err}</div>}
+    {blocked&&<div className="text-center card py-8"><div className="text-4xl mb-2">🛑</div><p className="font-bold">خلصت حدك اليومي</p><p className="text-gray-500 text-sm">القانون: {RULES.DAILY_CAP} واجبات باليوم كحد أقصى — رجوع بكرة</p></div>}
+    {!pubs.length&&<p className="text-center text-gray-400 py-8 card">ما في واجبات منشورة بعد — المشرف بينشر أول واجب قريب 📢</p>}
+    {pubs.map(pub=>{
+      const solved=doneToday(pub.id);
+      return (
+      <div key={pub.id} className="card p-4">
+        <div className="flex justify-between items-start">
+          <div>
+            <p className="font-bold">{pub.subject} — {pub.title}</p>
+            <p className="text-xs text-gray-400">نُشر بواسطة المشرف • {fmt(pub.ts)}</p>
+          </div>
+          <span className="text-xs bg-[#0A7C42]/10 text-[#0A7C42] font-bold rounded-lg px-2 py-1">📢 منشور</span>
+        </div>
+        {!blocked&&!solved&&
+          <div className="mt-3 space-y-2">
+            <div className="flex gap-2">
+              <button onClick={()=>setPhFor({pub,type:'solo',groupId:''})} className="btn flex-1 py-2 bg-[#0A7C42] text-white">حلّي فردي +20 📷</button>
+              <button onClick={()=>{const g=grpSel[pub.id]||''; if(!g){setErr('اختر غرفة للحل الجماعي أولاً');return;} setPhFor({pub,type:'group',groupId:g});}} className="btn flex-1 py-2 bg-white border-2 border-[#0A7C42] text-[#0A7C42]">جماعي +10 📷</button>
+            </div>
+            <select value={grpSel[pub.id]||''} onChange={e=>setGrpSel({...grpSel,[pub.id]:e.target.value})}>
+              <option value="">— للحل الجماعي: اختر غرفتكم —</option>
+              {db.groups.filter(canSee).map(g=><option key={g.id} value={g.id}>{g.name} (غرفة {g.room})</option>)}
+            </select>
+            {grpSel[pub.id]&&<button onClick={()=>setTab&&setTab('rooms')} className="text-xs text-[#0A7C42] underline">ادخلوا الغرفة الصوتية من تاب «الغرف» وادعوا أصحابكم</button>}
+          </div>}
+        {solved&&<div className="mt-3 text-sm bg-gray-50 rounded-xl px-3 py-2 text-gray-500">✓ قدّمت حلّي لهذا الواجب اليوم — بانتظار مراجعة المشرف</div>}
+      </div>);
+    })}
+    {phFor&&<PhotoModal pf={phFor} onClose={()=>setPhFor(null)} onSubmit={doSubmit}/>}
+  </div>);
+}
+
+/* نافذة رفع صور الحل — الحد الأدنى صورتان */
+function PhotoModal({pf,onClose,onSubmit}){
+  const [photos,setPhotos]=useState([]);
+  const [busy,setBusy]=useState(false);
+  const [err,setErr]=useState(null);
+  const addFiles=files=>{
+    const arr=[...files].filter(f=>f.type.startsWith('image/'));
+    if(!arr.length) return;
+    setBusy(true);
+    let done=0; const added=[];
+    arr.forEach(f=>{
+      compressPhoto(f,(e,data)=>{ done++;
+        if(!e) added.push(data);
+        if(done===arr.length){
+          setBusy(false);
+          setPhotos(p=>{
+            const ex=new Set(p);
+            const seen=[];
+            const uniq=added.filter(x=>{ if(ex.has(x)||seen.includes(x)){ return false; } seen.push(x); return true; });
+            if(uniq.length<added.length) setErr('ممنوع رفع نفس الصورة مرتين — كل صورة لازم تكون مختلفة');
+            if((p.length+uniq.length)>6){ setErr('الحد الأقصى 6 صور'); return p; }
+            return [...p,...uniq];
+          });
+        }
+      });
+    });
+  };
+  const ready=photos.length>=RULES.MIN_PHOTOS;
+  return (
+    <div className="fixed inset-0 z-50 bg-black/60 flex items-end sm:items-center justify-center p-4" onClick={onClose}>
+      <div className="card p-5 w-full max-w-md" onClick={e=>e.stopPropagation()}>
+        <p className="font-bold text-lg mb-1">📷 صور الحل {pf.type==='group'?'الجماعي':'الفردي'}</p>
+        <p className="text-sm text-gray-500 mb-3">{pf.pub.subject} — {pf.pub.title}</p>
+        <div className="border-2 border-[#0A7C42] bg-green-50 rounded-xl p-3 text-center mb-3">
+          <p className="text-[#0A7C42] font-black text-lg">{photos.length} / {RULES.MIN_PHOTOS}</p>
+          <p className="text-xs text-gray-600">{ photos.length>=RULES.MIN_PHOTOS ? 'تمام! صورك كافية ✓' : 'لازم صورة كتابك على الأقل — «أقل شي صورتين»' }</p>
+        </div>
+        {photos.length>0&&<div className="flex gap-2 overflow-x-auto mb-3 max-h-40">
+          {photos.map((p,i)=><span key={i} className="relative shrink-0"><img src={p} className="h-24 rounded-lg border" style={{width:'auto'}}/><button onClick={()=>setPhotos(photos.filter((_,j)=>j!==i))} className="absolute top-0 right-0 bg-red-600 text-white rounded-bl-lg text-xs px-1.5">✕</button></span>)}
+        </div>}
+        <label className="btn w-full py-3 bg-white border-2 border-dashed border-[#0A7C42] text-[#0A7C42] block text-center cursor-pointer mb-2">
+          {busy?'جاري تجهيز الصور…':'التقط صورة / اختر من معرض صور جهازك 📸'}
+          <input type="file" accept="image/*" multiple className="hidden" onChange={e=>{addFiles(e.target.files); e.target.value='';}}/>
+        </label>
+        {err&&<p className="text-red-600 text-sm mb-2">{err}</p>}
+        <button disabled={!ready||busy} onClick={()=>onSubmit(pf,photos)} className="btn w-full py-3 bg-[#0A7C42] text-white text-lg mb-2 disabled:opacity-40">سلّم الحل بالصور ✓</button>
+        <button onClick={onClose} className="btn w-full py-2 bg-gray-100">تراجع</button>
+      </div>
+    </div>);
+}
+
+function Rooms({db,me,createGroup,delGroup}){
+  const [name,setName]=useState('');
+  const [vis,setVis]=useState('public');
+  const [invited,setInvited]=useState([]); // اسماء مستخدم مدعوين (للخاص)
+  const [openRoom,setOpenRoom]=useState(()=>{ try{ const oid=sessionStorage.getItem('silbood_open_room'); if(oid){ const g=db.groups.find(x=>x.id===oid); if(g){ sessionStorage.removeItem('silbood_open_room'); return g; } } }catch(e){} return null; });
+  const canSee=g=>g.visibility!=='private'||g.by===me.id||(g.invited||[]).includes(me.id);
+  const roomLink=g=>location.href.split('#')[0]+'#room='+g.room+'&key='+g.code;
+  const inviteTxt=invited.length? invited.join('، ') : '— ما حددت أحد —';
+  return (<div className="space-y-4 mt-2">
+    <div className="card p-4">
+      <p className="font-bold mb-2">افتح غرفتك 📣</p>
+      <div className="flex gap-2">
+        <input placeholder="اسم الغرفة (مثلاً: شابتر 3 فيزياء)" onChange={e=>setName(e.target.value)}/>
+        <button onClick={()=>{ if(name.trim()){ createGroup(name.trim(),me.id,{visibility:vis,invited}); setName(''); setInvited([]);} }} className="btn px-4 bg-[#0A7C42] text-white">إنشاء</button>
+      </div>
+      <div className="flex gap-2 mt-3">
+        <button onClick={()=>setVis('public')} className={"btn flex-1 py-2 "+(vis==='public'?'bg-[#0A7C42] text-white':'bg-white border border-gray-300 text-gray-600')}>🌍 عام — الكل يدخل</button>
+        <button onClick={()=>setVis('private')} className={"btn flex-1 py-2 "+(vis==='private'?'bg-[#0A7C42] text-white':'bg-white border border-gray-300 text-gray-600')}>🔒 خاص — بيدك بس</button>
+      </div>
+      {vis==='private'&&
+        <div className="mt-3 border border-gray-200 rounded-xl p-3 bg-gray-50">
+          <p className="text-xs font-bold text-gray-600 mb-2">اختار أصحابك اللي بيقدروا يدخلوا (يقدرون يلحقوا عن طريق رابط التصريح هان):</p>
+          <div className="flex flex-wrap gap-2">
+            {db.students.filter(s=>s.id!==me.id).map(s=>(
+              <button key={s.id} onClick={()=>setInvited(invited.includes(s.id)? invited.filter(x=>x!==s.id):[...invited,s.id])}
+                className={"btn text-xs px-3 py-1.5 rounded-full border "+(invited.includes(s.id)?'bg-[#0A7C42] text-white border-[#0A7C42]':'bg-white border-gray-300 text-gray-600')}>{s.name}</button>))}
+            {!db.students.filter(s=>s.id!==me.id).length&&<p className="text-xs text-gray-400">ما في طلاب مسجلين بعد — بترسل الرابط بعدين</p>}
+          </div>
+        </div>}
+      <p className="text-xs text-gray-400 mt-2">الحل الجماعي = 10 نقاط لكل عضو بقدّم صورتين على الأقل من حله</p>
+    </div>
+    {db.groups.filter(canSee).map(g=>(
+      <div key={g.id} className="card p-4">
+        <div className="flex justify-between items-center">
+          <div><p className="font-bold">{g.name} <span className={"text-[10px] px-1.5 py-0.5 rounded font-bold align-middle "+(g.visibility==='private'?'bg-red-100 text-red-700':'bg-green-100 text-[#0A7C42]')}>{g.visibility==='private'?'🔒 خاص':'🌍 عام'}</span></p>
+          <p className="text-xs text-gray-400">غرفة: {g.room} • أعضاء: {(g.invited||[]).length + (g.by===me.id?1:0)}</p></div>
+          <div className="flex gap-2">
+            <button onClick={()=>setOpenRoom(g)} className="btn px-4 py-2 bg-[#0A7C42] text-white">دخول الغرفة</button>
+            {g.by===me.id&&<button onClick={()=>delGroup(g.id)} className="btn px-2 text-gray-300">✕</button>}
+          </div>
+        </div>
+        {g.by===me.id&&g.visibility==='private'&&
+          <div className="mt-2 bg-gray-50 border border-gray-200 rounded-xl p-2.5 text-xs">
+            <p className="text-gray-600 mb-1">🔗 رابط دعوة أصدقائك (يشاركه عندك صديق واحد):</p>
+            <div className="flex gap-2 items-center">
+              <input readOnly value={roomLink(g)} className="text-[11px] py-1"/>
+              <button onClick={()=>{ try{ navigator.clipboard.writeText(roomLink(g)); alert('الرابط انسخ ✓'); }catch(e){ prompt('انسخ الرابط يدوياً:', roomLink(g)); } }} className="btn px-3 py-1 bg-[#15201B] text-white">نسخ</button>
+            </div>
+            <p className="text-gray-400 mt-1">مدعوين مباشرة: {inviteTxt}</p>
+          </div>}
+        {openRoom&&openRoom.id===g.id&&
+          <div className="fixed inset-0 z-50 bg-[#15201B] flex flex-col">
+            <div className="flex justify-between items-center px-4 py-2.5 bg-black/40 text-white">
+              <div><span className="font-bold">🔊 {g.name}</span><span className="text-white/50 text-xs block">غرفة: {g.room} — دراسة صوتية</span></div>
+              <button onClick={()=>setOpenRoom(null)} className="btn px-4 py-1.5 bg-red-600 text-white text-sm">إغلاق ✕</button>
+            </div>
+            <iframe title={g.room} src={'https://meet.jit.si/'+g.room+'#config.prejoinPageEnabled=false'} className="w-full flex-1" style={{height:'calc(100vh - 52px)',border:'0'}} allow="camera; microphone; fullscreen; display-capture; autoplay"/>
+          </div>}
+      </div>
+    ))}
+    {!db.groups.filter(canSee).length&&<p className="text-center text-gray-400 py-8 card">ما في غرف متاحة لعك — أنشأ غرفة أو اطلب رابط دعوة 🔗</p>}
+  </div>);
+}
+
+function Board({board,meId}){
+  return (<div className="card mt-2 divide-y">
+    <p className="font-bold p-4 pb-2">متصدرو الصف</p>
+    {board.length===0&&<p className="text-center text-gray-400 py-6">ما في طلاب بعد</p>}
+    {board.map((s,i)=>(
+      <div key={s.id} className={"flex items-center gap-3 px-4 py-3 "+(s.id===meId?'bg-green-50/60':'')}>
+        <span className="text-xl w-7 text-center">{['🥇','🥈','🥉'][i]||'#'+(i+1)}</span>
+        <div className="flex-1"><p className="font-bold">{s.name}{s.id===meId&&<span className="text-xs text-[#0A7C42]"> (أنت)</span>}</p>
+        <p className="text-xs text-gray-400">🔥 {s.streak} يوم سترِيك</p></div>
+        <span className="font-black">{s.points}</span>
+      </div>))}
+  </div>);
+}
+
+function Points({db,me,redeem,pending,attachVideo,videoFor,setVideoFor}){
+  const b=RULES.BADGES.find(x=>x.p>me.points)||RULES.BADGES[2];
+  const mine=db.assignments.filter(a=>a.sid===me.id).slice().reverse();
+  const hist=db.history.filter(h=>h.sid===me.id).slice().reverse();
+  const payouts=db.payouts.filter(p=>p.sid===me.id).reverse();
+  return (<div className="space-y-4 mt-2">
+    {videoFor&&<VideoBox aid={videoFor} attachVideo={attachVideo} done={()=>setVideoFor(null)}/>}
+    <div className="card p-4">
+      <p className="font-bold mb-3">أوسمتي</p>
+      <div className="flex justify-between">{RULES.BADGES.map(x=>{
+        const got=me.points>=x.p;
+        return <div key={x.n} className={"text-center flex-1 "+(got?'':'opacity-30')}><div className="text-3xl">{x.i}</div><p className="text-xs font-bold">{x.n}</p><p className="text-[10px] text-gray-400">{x.p} نقطة</p></div>;})}
+      </div>
+      <p className="text-xs text-gray-500 text-center mt-2">باقي لك {Math.max(0,b.p-me.points)} نقطة على «{b.n}»</p>
+    </div>
+    <div className="card p-4">
+      <p className="font-bold mb-2">الاستبدال</p>
+      <p className="text-sm text-gray-600">500 نقطة = 30 قرشاً أردنياً • نقاطك لا تنتهي — إذا فرغ صندوق الشهر، صرفك أول الشهر القادم</p>
+      <button disabled={me.points<RULES.REDEEM_POINTS} onClick={()=>alert(redeem(me.id)||'تم الاستبدال!')} className="btn mt-3 w-full py-3 bg-[#C9992E] text-white disabled:opacity-40">استبدل 500 نقطة</button>
+      {payouts.map(p=>(<div key={p.id} className={"mt-2 text-sm rounded-xl px-3 py-2 border "+(p.paid?'border-green-300 bg-green-50':'border-orange-300 bg-orange-50')}>{p.day} — {p.status}</div>))}
+    </div>
+    {pending.length>0&&<div className="card p-4">
+      <p className="font-bold mb-2">بانتظار المراجعة ({pending.length})</p>
+      {pending.filter(a=>a.status==='awaiting').map(a=>(
+        <div key={a.id} className="flex items-center justify-between bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 mb-2 text-sm">
+          <span>🎥 {a.subject} — محتاج فيديو شرح 15 ثانية</span>
+          <button onClick={()=>setVideoFor(a.id)} className="btn px-3 py-1 bg-amber-500 text-white">أرفق</button>
+        </div>))}
+      {pending.filter(a=>a.status==='pending').length>0&&<p className="text-xs text-gray-400">{pending.filter(a=>a.status==='pending').length} واجب في رأي المشرف</p>}
+    </div>}
+    <div className="card p-4"><p className="font-bold mb-3">سجل الواجبات</p>
+      {mine.length===0&&<p className="text-gray-400 text-center py-4">سجّل أول واجب لك ✍️</p>}
+      {mine.map(a=>(
+        <div key={a.id} className="flex justify-between items-center py-2 border-b border-gray-100 text-sm">
+          <span>{a.subject} — {a.title}<span className="text-gray-400 text-xs"> ({a.type==='group'?'جماعي':'فردي'} • {a.day})</span></span>
+          <StatusBadge a={a}/>
+        </div>))}
+    </div>
+    <div className="card p-4"><p className="font-bold mb-3">السجل الكامل</p>
+      {hist.map((h,i)=>(<div key={i} className="flex justify-between py-1.5 border-b border-gray-50 text-sm"><span className="text-gray-600">{h.note}</span><span className={h.pts>0?'text-[#0A7C42] font-bold':h.pts<0?'text-red-600 font-bold':''}>{h.pts>0?'+'+h.pts:h.pts<0?h.pts:''}</span></div>))}
+    </div>
+  </div>);
+}
+function StatusBadge({a}){
+  const M={approved:['✓ معتمدة','text-green-700 bg-green-100'],rejected:['✕ مرفوضة','text-red-700 bg-red-100'],pending:['⏳ بمراجعة','text-amber-700 bg-amber-100'],awaiting:['🎥 فيديو','text-orange-700 bg-orange-100']};
+  const [l,c]=M[a.status]||['','']; return <span className={"text-xs px-2 py-1 rounded-lg font-bold "+c}>{l}</span>;
+}
+function VideoBox({aid,attachVideo,done}){
+  const ref=useRef();
+  return (<div className="card p-4 border-amber-400">
+    <p className="font-bold mb-1">🎥 اشرح واجبك بفيديو</p>
+    <p className="text-sm text-gray-600 mb-3">سجّل فيديو 15 ثانية — دقيقة وحدة تطوّل فيها كيف حليت. مشرفك بس بيشوفه، وبينحذف بعد 24 ساعة من مراجعته.</p>
+    <input ref={ref} type="file" accept="video/*,audio/*" className="hidden" onChange={e=>{ if(e.target.files[0]) attachVideo(aid,e.target.files[0],m=>{ if(!m)done(); else alert(m); }); }}/>
+    <button onClick={()=>ref.current.click()} className="btn w-full py-3 bg-[#0A7C42] text-white">سجّل/اختر الفيديو</button>
+  </div>);
+}
+
+/* ================= لوحة المشرف ================= */
+function Sup({db,approve,reject,attachVideo,setPool,markPaid,publish,delPub,logout}){
+  const [tab,setTab]=useState('review');
+  const [poolIn,setPoolIn]=useState(db.pool.remaining);
+  const [pubF,setPubF]=useState({subject:'عربي',title:''});
+  const [pubErr,setPubErr]=useState(null);
+  const [showT,setShowT]=useState(false);
+  const pend=db.assignments.filter(a=>a.status==='pending'||a.status==='awaiting');
+  const nameOf=id=>{ const s=db.students.find(x=>x.id===id); return s?s.name:'—'; };
+  const solvedCount=pid=>db.assignments.filter(a=>a.pubId===pid).length;
+  const tabs=[['pubs','نشر واجب','📢'],['review','المراجعة','📋'],['videos','الفيديوهات','🎥'],['pool','الصندوق','💰'],['payouts','الصرف','🧾'],['students','الطلاب','👥']];
+  return (<div className="max-w-lg mx-auto min-h-screen pb-16">
+    <div className="bg-[#15201B] text-white px-4 pt-5 pb-4">
+      <div className="flex justify-between items-center">
+        <div><h1 className="font-black text-xl">لوحة المشرف</h1><p className="text-white/60 text-sm">{db.supervisor.name}</p></div>
+        <button onClick={logout} className="btn text-sm px-3 py-1 border border-white/30 text-white/70">خروج</button>
+      </div>
+    </div>
+    <div className="flex overflow-x-auto gap-1 px-3 py-2 bg-white border-b">
+      {tabs.map(([k,l,i])=><button key={k} onClick={()=>setTab(k)} className={"btn whitespace-nowrap px-3 py-1.5 text-sm "+(tab===k?'bg-[#0A7C42] text-white':'text-gray-500')}>{i} {l}</button>)}
+    </div>
+    <div className="p-4 space-y-3">
+      {tab==='pubs'&&<>
+        <div className="card p-4">
+          <p className="font-bold mb-1">📢 انشر واجباً جديداً للطلاب</p>
+          <p className="text-xs text-gray-400 mb-3">الطالب يحلّه فردياً (+20) أو جماعياً (+10)، ويقسم قبل التسليم — وبعدها يظهر عندك بالمراجعة.</p>
+          <select value={pubF.subject} onChange={e=>setPubF({...pubF,subject:e.target.value})} className="mb-2">{RULES.SUBJECTS.map(s=><option key={s}>{s}</option>)}</select>
+          <input placeholder="عنوان الواجب (مثلاً: التمارين ص28)" value={pubF.title} onChange={e=>setPubF({...pubF,title:e.target.value})} className="mb-2"/>
+          {pubErr&&<p className="text-red-600 text-sm mb-2">{pubErr}</p>}
+          <button onClick={()=>{ const m=publish(pubF.subject,pubF.title); if(m)setPubErr(m); else {setPubErr(null); setPubF({...pubF,title:''});} }} className="btn w-full py-3 bg-[#0A7C42] text-white">نشر الواجب 📢</button>
+        </div>
+        {[...(db.pubs||[])].reverse().map(p=>(
+          <div key={p.id} className="card px-4 py-3 flex justify-between items-center">
+            <div><p className="font-bold">{p.subject} — {p.title}</p>
+            <p className="text-xs text-gray-400">نُشر {fmt(p.ts)} • {solvedCount(p.id)} حل مُسلَّم</p></div>
+            <button onClick={()=>{ if(confirm('حذف الواجب المنشور؟')) delPub(p.id); }} className="btn text-sm px-2 text-gray-300 hover:text-red-500">✕</button>
+          </div>))}
+        {!(db.pubs||[]).length&&<p className="text-center text-gray-400 py-4">ما نشرت واجبات بعد</p>}
+      </>}
+      {tab==='review'&&<>{pend.length===0&&<p className="text-center text-gray-400 py-8">ما في شي بالمطالبة 🎉</p>}
+        {pend.map(a=>(
+          <div key={a.id} className="card p-4">
+            <div className="flex justify-between"><p className="font-bold">{nameOf(a.sid)} — {a.subject}</p><StatusBadge a={a}/></div>
+            <p className="text-sm text-gray-500">{a.title} • {a.type==='group'?'جماعي (+'+RULES.GROUP_POINTS+')':'فردي (+'+RULES.SOLO_POINTS+')'} • {fmt(a.ts)}</p>
+            <p className="text-[11px] text-gray-400 mt-1">📷 صور الحل: {(a.photos||[]).length}</p>
+            {(a.photos||[]).length>0&&<div className="flex gap-2 overflow-x-auto mt-2 max-h-44">{a.photos.map((p,i)=><img key={i} src={p} className="h-32 rounded-lg border shrink-0" style={{width:'auto'}}/>)}</div>}
+            {a.status==='pending'&&
+              <div className="flex gap-2 mt-3">
+                <button onClick={()=>approve(a.id)} className="btn flex-1 py-2 bg-[#0A7C42] text-white">أوافق → +{a.points}</button>
+                <button onClick={()=>{const w=prompt('سبب الرفض؟','الشرح ما كفى'); if(w!==null)reject(a.id,w);}} className="btn flex-1 py-2 bg-red-600 text-white">أرفض</button>
+              </div>}
+          </div>))}
+      </>}
+      {tab==='videos'&&<>{db.assignments.filter(a=>a.video).length===0&&<p className="text-center text-gray-400 py-8">ما في فيديوهات مراجعة</p>}
+        {db.assignments.filter(a=>a.video).map(a=>(
+          <div key={a.id} className="card p-4">
+            <p className="font-bold">{nameOf(a.sid)} — {a.subject}</p>
+            <p className="text-xs text-gray-400 mb-2">محذوف تلقائياً: {fmt(a.videoDeleteAt)}</p>
+            {a.video.startsWith('data:audio')?<audio controls src={a.video} className="w-full"/>:<video controls src={a.video} className="w-full rounded-xl"/>}
+            <div className="flex gap-2 mt-2">
+              <button onClick={()=>approve(a.id)} className="btn flex-1 py-2 bg-[#0A7C42] text-white">شرح كافٍ → +{a.points}</button>
+              <button onClick={()=>{const w=prompt('سبب الرفض؟','الشرح ما كفى'); if(w!==null)reject(a.id,w);}} className="btn flex-1 py-2 bg-red-600 text-white">شرح ما كفى</button>
+            </div>
+          </div>))}
+      </>}
+      {tab==='pool'&&<div className="card p-4">
+        <p className="font-bold">صندوق الشهر ({monthKey()})</p>
+        <p className="text-sm text-gray-500 mb-3">السقف الموقّع: 30 دينار الهالي + احتياط 5. المتبقي:</p>
+        <div className="flex gap-2"><input type="number" step="0.01" value={poolIn} onChange={e=>setPoolIn(e.target.value)}/>
+          <button onClick={()=>setPool(+poolIn)} className="btn px-4 bg-[#0A7C42] text-white">تحديث</button></div>
+        <p className="text-xs text-gray-400 mt-2">لما يفرغ: الاستبدالات تروح على قائمة الانتظار تلقائياً (أول الشهر القادم)</p>
+      </div>}
+      {tab==='payouts'&&<>{db.payouts.length===0&&<p className="text-center text-gray-400 py-8">لا طلبات صرف</p>}
+        {db.payouts.slice().reverse().map(p=>(
+          <div key={p.id} className="card px-4 py-3 flex justify-between items-center">
+            <div><p className="font-bold">{nameOf(p.sid)}</p><p className="text-xs text-gray-400">{p.day} — {jod(RULES.REDEEM_JOD)}</p></div>
+            {p.status.includes('جاهز')?<button onClick={()=>markPaid(p.id)} className="btn px-3 py-1.5 bg-[#0A7C42] text-white text-sm">سلّمتُه</button>:<span className="text-sm text-orange-600 font-bold">{p.status}</span>}
+          </div>))}
+      </>}
+      {tab==='students'&&<div className="card divide-y">
+        {db.students.length===0&&<p className="text-center text-gray-400 py-8">ما في طالب مسجل بعد</p>}
+        {db.students.map(s=>(<div key={s.id} className="px-4 py-3 flex justify-between"><span>{s.name}<span className="text-gray-400 text-xs block">@{s.username} • 🔥{s.streak}</span></span><b>{s.points}</b></div>))}
+      </div>}
+      <p className="text-center text-xs text-gray-400 mt-4 pb-4"><button onClick={()=>setShowT(true)} className="underline text-[#0A7C42]">الشروط والخصوصية • توقيع ولي الأمر</button></p>
+      {showT&&<TermsModal onClose={()=>setShowT(false)}/>}
+    </div>
+  </div>);
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
